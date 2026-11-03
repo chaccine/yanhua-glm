@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>夜空烟花</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #05060f; }
+  canvas { display: block; position: fixed; inset: 0; touch-action: none; }
+  #panel {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(10, 12, 30, 0.55); backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 10px;
+    padding: 8px 12px; color: #cfd6ff; font: 13px/1.4 system-ui, sans-serif;
+    user-select: none;
+  }
+  #panel button {
+    background: rgba(255, 255, 255, 0.12); color: #e8ecff;
+    border: 1px solid rgba(255, 255, 255, 0.25); border-radius: 6px;
+    padding: 4px 12px; cursor: pointer; font: inherit;
+  }
+  #panel button:hover { background: rgba(255, 255, 255, 0.25); }
+  #panel button:active { transform: scale(0.96); }
+  #stats { min-width: 150px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="panel">
+  <button id="btnPause">暂停</button>
+  <button id="btnBurst">连发 ×10</button>
+  <span id="stats">粒子 0 | FPS --</span>
+</div>
+<script>
+'use strict';
+
+/* ================= 基础设置 ================= */
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d');
+const trailCv = document.createElement('canvas'); // 离屏拖尾层（烟花画在这里，带余晖）
+const tctx = trailCv.getContext('2d');
+const bgCv = document.createElement('canvas');    // 离屏背景层（渐变夜空 + 城市剪影，只在缩放时重绘）
+const bctx = bgCv.getContext('2d');
+
+const statsEl = document.getElementById('stats');
+const btnPause = document.getElementById('btnPause');
+const btnBurst = document.getElementById('btnBurst');
+
+let W = 0, H = 0;
+let stars = [];
+let paused = false;
+
+const GRAVITY = 260; // 重力加速度 px/s²
+const FADE = 0.18;   // 拖尾层每帧淡出强度（越小余晖越长）
+
+/* ================= 尺寸自适应 ================= */
+function resize() {
+  W = canvas.width = trailCv.width = bgCv.width = window.innerWidth;
+  H = canvas.height = trailCv.height = bgCv.height = window.innerHeight;
+  buildBackground();
+  buildStars();
+}
+window.addEventListener('resize', resize);
+
+/* ================= 背景：夜空渐变 + 城市剪影 ================= */
+function buildBackground() {
+  const g = bctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#050716');
+  g.addColorStop(0.55, '#0b1030');
+  g.addColorStop(0.85, '#1b1442');
+  g.addColorStop(1, '#2a1a4d');
+  bctx.fillStyle = g;
+  bctx.fillRect(0, 0, W, H);
+
+  // 沿地平线生成随机楼房剪影和亮着的窗户
+  let x = -10;
+  while (x < W + 10) {
+    const bw = 26 + Math.random() * 70;                // 楼宽
+    const bh = 30 + Math.random() * (H * 0.18);        // 楼高
+    bctx.fillStyle = '#070912';
+    bctx.fillRect(x, H - bh, bw, bh);
+    if (Math.random() < 0.2) {                         // 偶尔加根天线
+      bctx.fillRect(x + bw / 2 - 1, H - bh - 14, 2, 14);
+    }
+    bctx.fillStyle = 'rgba(255, 214, 130, 0.75)';
+    for (let wy = H - bh + 6; wy < H - 8; wy += 11) {
+      for (let wx = x + 5; wx < x + bw - 6; wx += 10) {
+        if (Math.random() < 0.28) bctx.fillRect(wx, wy, 3, 4);
+      }
+    }
+    x += bw + 2 + Math.random() * 8;
+  }
+}
+
+/* ================= 星星 ================= */
+function buildStars() {
+  stars = [];
+  const n = Math.floor(W * H / 9000);
+  for (let i = 0; i < n; i++) {
+    stars.push({
+      x: Math.random() * W,
+      y: Math.random() * H * 0.7,
+      r: 0.4 + Math.random() * 1.2,
+      ph: Math.random() * Math.PI * 2,   // 闪烁相位
+      sp: 0.5 + Math.random() * 1.5,     // 闪烁速度
+    });
+  }
+}
+
+/* ================= 粒子对象池 ================= */
+const particles = []; // 活动粒子
+const pool = [];      // 回收池，避免频繁 GC
+function acquire() { return pool.length ? pool.pop() : {}; }
+function release(i) { // 与末尾交换后移除，O(1)
+  pool.push(particles[i]);
+  particles[i] = particles[particles.length - 1];
+  particles.pop();
+}
+
+/* ================= 火箭 ================= */
+const rockets = [];
+
+// 从底部向 (tx, ty) 发射一枚烟花
+function launch(tx, ty) {
+  const sx = tx + (Math.random() - 0.5) * W * 0.08;
+  const hue = Math.random() * 360;
+  const dy = H - ty; // 需要上升的高度
+  // 用 v²=2gh 反解初速度，略微冲过头再爆更有感觉
+  const vy = -Math.sqrt(2 * GRAVITY * dy * (1.05 + Math.random() * 0.15));
+  const t = -vy / GRAVITY; // 到达顶点所需时间
+  rockets.push({
+    x: sx, y: H + 4,
+    vx: (tx - sx) / t, vy,
+    ty, hue,
+  });
+}
+
+/* ================= 爆炸：三种形状 ================= */
+function explode(x, y, hue) {
+  const r = Math.random();
+  const type = r < 0.34 ? 'sphere' : r < 0.67 ? 'ring' : 'heart';
+  const count = 80 + Math.floor(Math.random() * 70); // 80~150 个粒子
+  const spd = 110 + Math.random() * 100;             // 本次爆炸的基础速度
+  const sat = 85 + Math.random() * 15;
+
+  for (let i = 0; i < count; i++) {
+    const p = acquire();
+    let vx, vy, drag;
+    if (type === 'ring') {
+      // 圆环：角度均匀分布，速度几乎一致
+      const ang = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.05;
+      const s = spd * (0.92 + Math.random() * 0.12);
+      vx = Math.cos(ang) * s; vy = Math.sin(ang) * s;
+      drag = 1.1;
+    } else if (type === 'heart') {
+      // 心形：经典参数方程（注意 canvas 的 y 轴向下，需要翻转）
+      const t = (i / count) * Math.PI * 2;
+      vx = Math.pow(Math.sin(t), 3) * spd * 0.062;
+      vy = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * spd * 0.05;
+      vx += (Math.random() - 0.5) * 8;
+      vy += (Math.random() - 0.5) * 8;
+      drag = 0.55; // 阻力小一点，心形保持得更久
+    } else {
+      // 球形：随机方向，速度开方分布让边缘更密、像真实烟花
+      const ang = Math.random() * Math.PI * 2;
+      const s = spd * (0.25 + 0.75 * Math.sqrt(Math.random()));
+      vx = Math.cos(ang) * s; vy = Math.sin(ang) * s;
+      drag = 1.5;
+    }
+    p.x = x; p.y = y;
+    p.vx = vx; p.vy = vy;
+    p.drag = drag;
+    p.size = 1.4 + Math.random() * 1.6;
+    p.maxLife = p.life = 1.2 + Math.random() * 1.1;
+    // 颜色在生成时算好字符串，绘制时零开销
+    p.color = 'hsl(' + (hue + (Math.random() - 0.5) * 30) + ',' + sat + '%,' + (60 + Math.random() * 15) + '%)';
+    particles.push(p);
+  }
+}
+
+/* ================= 更新逻辑 ================= */
+function update(dt) {
+  // 火箭上升
+  for (let i = rockets.length - 1; i >= 0; i--) {
+    const rk = rockets[i];
+    rk.vy += GRAVITY * dt;
+    rk.x += rk.vx * dt;
+    rk.y += rk.vy * dt;
+    if (rk.vy >= -30 || rk.y <= rk.ty) { // 接近顶点或到达目标高度就爆炸
+      explode(rk.x, rk.y, rk.hue);
+      rockets.splice(i, 1);
+    }
+  }
+  // 粒子运动
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { release(i); continue; }
+    const d = 1 - p.drag * dt; // 空气阻力
+    p.vx *= d;
+    p.vy = p.vy * d + GRAVITY * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+  }
+}
+
+/* ================= 渲染 ================= */
+function render(now) {
+  // 1. 背景 + 闪烁星星
+  ctx.drawImage(bgCv, 0, 0);
+  ctx.fillStyle = '#fff';
+  for (const s of stars) {
+    ctx.globalAlpha = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(now * 0.001 * s.sp + s.ph));
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, 6.2832);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 2. 拖尾层：先整体淡出上一帧（形成余晖），再用叠加模式画亮点
+  tctx.globalCompositeOperation = 'destination-out';
+  tctx.fillStyle = 'rgba(0,0,0,' + FADE + ')';
+  tctx.fillRect(0, 0, W, H);
+  tctx.globalCompositeOperation = 'lighter';
+
+  // 火箭本体：一条短线段，配合淡出形成上升拖尾
+  tctx.lineWidth = 2;
+  for (const rk of rockets) {
+    tctx.strokeStyle = 'hsl(' + rk.hue + ',100%,75%)';
+    tctx.beginPath();
+    tctx.moveTo(rk.x - rk.vx * 0.02, rk.y - rk.vy * 0.02);
+    tctx.lineTo(rk.x, rk.y);
+    tctx.stroke();
+  }
+
+  // 粒子
+  for (const p of particles) {
+    tctx.globalAlpha = Math.min(1, p.life / p.maxLife);
+    tctx.fillStyle = p.color;
+    tctx.beginPath();
+    tctx.arc(p.x, p.y, p.size, 0, 6.2832);
+    tctx.fill();
+  }
+  tctx.globalAlpha = 1;
+  tctx.globalCompositeOperation = 'source-over';
+
+  // 3. 把拖尾层合成到主画布
+  ctx.drawImage(trailCv, 0, 0);
+}
+
+/* ================= 主循环 ================= */
+let last = performance.now();
+let fps = 60;
+let nextAuto = 0;          // 下次自动发射的时间戳
+const burstQueue = [];     // 连发队列
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05; // 切后台回来防止大步长
+  fps += (1 / Math.max(dt, 1e-4) - fps) * 0.05; // 平滑 FPS
+
+  if (paused) return;
+
+  // 自动发射：每 1~2 秒一枚
+  if (now >= nextAuto) {
+    launch(W * (0.15 + Math.random() * 0.7), H * (0.15 + Math.random() * 0.35));
+    nextAuto = now + 1000 + Math.random() * 1000;
+  }
+  // 连发队列
+  while (burstQueue.length && burstQueue[0] <= now) {
+    burstQueue.shift();
+    launch(W * (0.1 + Math.random() * 0.8), H * (0.12 + Math.random() * 0.38));
+  }
+
+  update(dt);
+  render(now);
+  statsEl.textContent = '粒子 ' + particles.length + ' | FPS ' + Math.round(fps);
+}
+
+/* ================= 交互 ================= */
+// 鼠标点击 / 触摸：从底部向该点发射
+canvas.addEventListener('pointerdown', function (e) {
+  launch(e.clientX, Math.min(e.clientY, H - 40));
+});
+
+btnPause.addEventListener('click', function () {
+  paused = !paused;
+  btnPause.textContent = paused ? '继续' : '暂停';
+});
+
+btnBurst.addEventListener('click', function () {
+  const now = performance.now();
+  for (let i = 0; i < 10; i++) burstQueue.push(now + i * 150); // 间隔 150ms 依次升空
+});
+
+/* ================= 启动 ================= */
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
